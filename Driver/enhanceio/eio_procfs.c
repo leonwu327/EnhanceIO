@@ -602,6 +602,81 @@ eio_dirty_set_low_threshold_sysctl(struct ctl_table *table, int write,
 }
 
 /*
+ * sequential_write_threshold_sysctl
+ */
+static int
+eio_sequential_write_threshold_sysctl(struct ctl_table *table, int write,
+				   void __user *buffer, size_t *length,
+				   loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post the existing value */
+
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.sequential_write_threshold =
+			dmc->sysctl_active.sequential_write_threshold;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+    
+	if (proc_dointvec(table, write, buffer, length, ppos)) {
+        pr_err("sequential_write_threshold should be an integer in [0 - 1024]\n");
+        return -EINVAL;
+    }
+
+	/* do write processing */
+
+	if (write) {
+		int error;
+		uint32_t old_value;
+        
+		/* do sanity check */
+
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("sequential_write_threshold is valid only for writeback cache\n");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.sequential_write_threshold > 1024) {
+			pr_err
+				("sequential_write_threshold should be [0 - 1024]\n");
+			return -EINVAL;
+		}
+        
+		if (dmc->sysctl_pending.sequential_write_threshold ==
+		    dmc->sysctl_active.sequential_write_threshold)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		old_value = dmc->sysctl_active.sequential_write_threshold;
+		dmc->sysctl_active.sequential_write_threshold =
+			dmc->sysctl_pending.sequential_write_threshold;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
+		/* apply the new tunable value */
+
+		/* Store the change persistently */
+		error = eio_sb_store(dmc);
+		if (error) {
+			/* restore back the old value and return error */
+			spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+			dmc->sysctl_active.sequential_write_threshold = old_value;
+			spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
+			return error;
+		}
+	}
+
+	return 0;
+}
+
+
+/*
  * eio_autoclean_threshold_sysctl
  */
 static int
@@ -1092,7 +1167,7 @@ static struct sysctl_table_common {
 	},
 };
 
-#define NUM_WRITEBACK_SYSCTLS   7
+#define NUM_WRITEBACK_SYSCTLS   8
 
 static struct sysctl_table_writeback {
 	struct ctl_table_header *sysctl_header;
@@ -1140,6 +1215,12 @@ static struct sysctl_table_writeback {
 			.maxlen		= sizeof(uint32_t),
 			.mode		= 0644,
 			.proc_handler	= &eio_dirty_set_low_threshold_sysctl,
+		}
+        , {             /* 8 */
+			.procname	= "sequential_write_threshold",
+			.maxlen		= sizeof(uint32_t),
+			.mode		= 0644,
+			.proc_handler	= &eio_sequential_write_threshold_sysctl,
 		}
 		,
 	}
@@ -1255,12 +1336,14 @@ void eio_procfs_ctr(struct cache_c *dmc)
 
 	s = eio_cons_procfs_cachename(dmc, "");
 	entry = proc_mkdir(s, NULL);
-	kfree(s);
+
 	if (entry == NULL) {
 		pr_err("Failed to create /proc/%s", s);
+		kfree(s);
 		return;
 	}
-
+	kfree(s);
+	
 	s = eio_cons_procfs_cachename(dmc, PROC_STATS);
 	entry = proc_create_data(s, 0, NULL, &eio_stats_operations, dmc);
 	kfree(s);
@@ -1421,6 +1504,8 @@ static void *eio_find_sysctl_data(struct cache_c *dmc, struct ctl_table *vars)
 		return (void *)&dmc->sysctl_pending.control;
 	if (strcmp(vars->procname, "invalidate") == 0)
 		return (void *)&dmc->sysctl_pending.invalidate;
+	if (strcmp(vars->procname, "sequential_write_threshold") == 0)
+		return (void *)&dmc->sysctl_pending.sequential_write_threshold;
 
 	pr_err("Cannot find sysctl data for %s", vars->procname);
 	return NULL;
@@ -1779,7 +1864,7 @@ static int eio_stats_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "%-26s %12lld\n", "readdisk",
 		   (int64_t)atomic64_read(&stats->readdisk));
 	seq_printf(seq, "%-26s %12lld\n", "writedisk",
-		   (int64_t)atomic64_read(&stats->readdisk));
+		   (int64_t)atomic64_read(&stats->writedisk));
 	seq_printf(seq, "%-26s %12lld\n", "readcache",
 		   (int64_t)atomic64_read(&stats->readcache));
 	seq_printf(seq, "%-26s %12lld\n", "readfill",
@@ -1799,6 +1884,9 @@ static int eio_stats_show(struct seq_file *seq, void *v)
 		   (int64_t)atomic64_read(&stats->rdtime_ms));
 	seq_printf(seq, "%-26s %12lld\n", "wrtime_ms",
 		   (int64_t)atomic64_read(&stats->wrtime_ms));
+	seq_printf(seq, "%-26s %12lld\n", "queued_count",
+		   (int64_t)atomic64_read(&stats->queued_count));
+
 	return 0;
 }
 
@@ -1825,6 +1913,8 @@ static int eio_errors_show(struct seq_file *seq, void *v)
 		   dmc->eio_errors.ssd_read_errors);
 	seq_printf(seq, "ssd_write_errors    %4u\n",
 		   dmc->eio_errors.ssd_write_errors);
+	seq_printf(seq, "ssd_io_blocking     %4u\n",
+		   dmc->eio_errors.ssd_io_blocking);
 	seq_printf(seq, "memory_alloc_errors %4u\n",
 		   dmc->eio_errors.memory_alloc_errors);
 	seq_printf(seq, "no_cache_dev        %4u\n",

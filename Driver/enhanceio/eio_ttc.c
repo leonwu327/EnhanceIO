@@ -1641,7 +1641,7 @@ static int eio_overlap_split_bio(struct request_queue *q, struct bio *bio)
 		bio_endio(bio, -ENOMEM);
 		return 0;
 	}
-	bc = kmalloc(sizeof(struct bio_container), GFP_NOWAIT);
+	bc = kmem_cache_alloc(_bc_cache, GFP_NOWAIT | __GFP_ZERO);
 	if (!bc) {
 		bio_endio(bio, -ENOMEM);
 		kfree(bioptr);
@@ -1672,7 +1672,7 @@ static int eio_overlap_split_bio(struct request_queue *q, struct bio *bio)
 		for (i--; i >= 0; i--)
 			bio_put(bioptr[i]);
 		bio_endio(bio, -ENOMEM);
-		kfree(bc);
+		kmem_cache_free(_bc_cache, bc);
 		goto out;
 	}
 

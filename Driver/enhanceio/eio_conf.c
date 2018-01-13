@@ -49,6 +49,9 @@ struct work_struct _kcached_wq;
 
 static struct kmem_cache *_job_cache;
 struct kmem_cache *_io_cache;   /* cache of eio_context objects */
+struct kmem_cache *_bc_cache;
+struct kmem_cache *_mdreq_cache;
+
 mempool_t *_job_pool;
 mempool_t *_io_pool;            /* pool of eio_context object */
 
@@ -195,6 +198,18 @@ static int eio_jobs_init(void)
 	if (!_job_pool)
 		goto out;
 
+	_bc_cache = kmem_cache_create("eio_bio_container",
+				      sizeof(struct bio_container),
+				      __alignof__(struct bio_container), 0, NULL);
+	if (!_bc_cache)
+		goto out;
+	
+	_mdreq_cache = kmem_cache_create("eio_md_request",
+				      sizeof(struct mdupdate_request),
+				      __alignof__(struct mdupdate_request), 0, NULL);
+	if (!_mdreq_cache)
+		goto out;
+
 	_io_cache = kmem_cache_create(KMEM_EIO_IO,
 				      sizeof(struct eio_context),
 				      __alignof__(struct eio_context), 0, NULL);
@@ -211,6 +226,10 @@ static int eio_jobs_init(void)
 out:
 	if (_io_pool)
 		mempool_destroy(_io_pool);
+	if (_bc_cache)
+		kmem_cache_destroy(_bc_cache);
+	if (_mdreq_cache)
+		kmem_cache_destroy(_mdreq_cache);
 	if (_io_cache)
 		kmem_cache_destroy(_io_cache);
 	if (_job_pool)
@@ -219,7 +238,7 @@ out:
 		kmem_cache_destroy(_job_cache);
 
 	_job_pool = _io_pool = NULL;
-	_job_cache = _io_cache = NULL;
+	_job_cache = _bc_cache = _mdreq_cache = _io_cache = NULL;
 	return -ENOMEM;
 }
 
@@ -230,9 +249,12 @@ static void eio_jobs_exit(void)
 	mempool_destroy(_job_pool);
 	kmem_cache_destroy(_io_cache);
 	kmem_cache_destroy(_job_cache);
+    kmem_cache_destroy(_bc_cache);
+    kmem_cache_destroy(_mdreq_cache);
 
 	_job_pool = _io_pool = NULL;
-	_job_cache = _io_cache = NULL;
+    _job_cache = _io_cache = _bc_cache = _mdreq_cache = NULL;
+
 }
 
 static int eio_kcached_init(struct cache_c *dmc)
@@ -324,6 +346,9 @@ int eio_sb_store(struct cache_c *dmc)
 	sb->sbf.time_based_clean_interval =
 		cpu_to_le32(dmc->sysctl_active.time_based_clean_interval);
 	sb->sbf.autoclean_threshold = cpu_to_le32(dmc->sysctl_active.autoclean_threshold);
+    sb->sbf.sequential_write_threshold =
+		cpu_to_le32(dmc->sysctl_active.sequential_write_threshold);
+    
 
 	/* write out to ssd */
 	where.bdev = dmc->cache_dev->bdev;
@@ -1155,6 +1180,10 @@ static int eio_md_load(struct cache_c *dmc)
 		le32_to_cpu(header->sbf.time_based_clean_interval);
 	dmc->sysctl_active.autoclean_threshold =
 		le32_to_cpu(header->sbf.autoclean_threshold);
+	dmc->sysctl_active.sequential_write_threshold =
+		le32_to_cpu(header->sbf.sequential_write_threshold);
+    if ( 0 == dmc->sysctl_active.sequential_write_threshold )
+        dmc->sysctl_active.sequential_write_threshold = SEQUENTIAL_WRITE_THRESH_DEF;
 
 	i = eio_mem_init(dmc);
 	if (i == -1) {
@@ -1771,6 +1800,8 @@ int eio_cache_create(struct cache_rec_short *cache)
 	dmc->sysctl_active.autoclean_threshold = AUTOCLEAN_THRESH_DEF;
 	dmc->sysctl_active.time_based_clean_interval =
 		TIME_BASED_CLEAN_INTERVAL_DEF(dmc);
+    
+    dmc->sysctl_active.sequential_write_threshold = SEQUENTIAL_WRITE_THRESH_DEF;
 
 	spin_lock_init(&dmc->cache_spin_lock);
 	if (persistence == CACHE_CREATE) {
@@ -2555,6 +2586,8 @@ static int __init eio_init(void)
 	int r;
 	extern struct bus_type scsi_bus_type;
 
+    pr_info("init: begin to init enhanceio module");
+        
 	eio_ttc_init();
 	r = eio_create_misc_device();
 	if (r)

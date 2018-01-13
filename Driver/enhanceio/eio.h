@@ -147,7 +147,8 @@ extern struct work_struct _kcached_wq;
 extern int eio_force_warm_boot;
 extern atomic_t nr_cache_jobs;
 extern mempool_t *_job_pool;
-
+extern struct kmem_cache *_bc_cache;
+extern struct kmem_cache *_mdreq_cache;
 /*
  * This file has three sections as follows:
  *
@@ -271,6 +272,7 @@ union eio_superblock {
 		__le32 dirty_set_low_threshold;
 		__le32 time_based_clean_interval;
 		__le32 autoclean_threshold;
+        __le32 sequential_write_threshold;
 	} sbf;
 	u_int8_t padding[EIO_SUPERBLOCK_SIZE];
 };
@@ -494,6 +496,8 @@ enum dev_notifier {
 #define AUTOCLEAN_THRESH_DEF            128     /* Number of I/Os which puts a hold on time based cleaning */
 #define AUTOCLEAN_THRESH_MAX            1024    /* Number of I/Os which puts a hold on time based cleaning */
 
+#define SEQUENTIAL_WRITE_THRESH_DEF     16    /* Ë³ĞòĞ´ioãĞÖµ */
+
 /* Inject a 5s delay between cleaning blocks and metadata */
 #define CLEAN_REMOVE_DELAY      5000
 
@@ -591,6 +595,7 @@ struct eio_errors {
 	int disk_write_errors;
 	int ssd_read_errors;
 	int ssd_write_errors;
+	int ssd_io_blocking;
 	int memory_alloc_errors;
 	int no_cache_dev;
 	int no_source_dev;
@@ -636,11 +641,12 @@ struct eio_stats {
 	atomic64_t rdtime_ms;   /* total read time in ms */
 	atomic64_t readcount;   /* total reads received so far */
 	atomic64_t writecount;  /* total writes received so far */
+    atomic64_t queued_count;  /* queued flag count*/
 };
 
 #define PENDING_JOB_HASH_SIZE                   32
 #define PENDING_JOB_HASH(index)                 ((index) % PENDING_JOB_HASH_SIZE)
-#define SIZE_HIST                               (128 + 1)
+#define SIZE_HIST                               (1024 + 1)
 #define EIO_COPY_PAGES                          1024    /* Number of pages for I/O */
 #define MIN_JOBS                                1024
 #define MIN_EIO_IO                              4096
@@ -671,6 +677,7 @@ struct eio_sysctl {
 	int32_t mem_limit_pct;
 	int32_t control;
 	u_int64_t invalidate;
+    uint32_t sequential_write_threshold;
 };
 
 /* forward declaration */
@@ -1080,6 +1087,13 @@ EIO_CACHE_STATE_GET(struct cache_c *dmc, u_int64_t index)
 	else
 		cache_state = dmc->cache[index].md4_u.u_s_md4.cache_state;
 	return cache_state;
+}
+
+static inline void 
+EIO_DEC_QUEUED_COUNT(struct cache_c *dmc, u_int64_t index)
+{
+    if( EIO_CACHE_STATE_GET(dmc, index) & QUEUED )
+        atomic64_dec_if_positive(&dmc->eio_stats.queued_count);
 }
 
 static inline void
